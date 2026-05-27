@@ -1,0 +1,49 @@
+name: E2E
+on:
+  pull_request:
+  schedule:
+    - cron: '0 4 * * *'
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: e2e
+          version: v0.24.0
+      - name: Install MetalLB
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml
+          kubectl -n metallb-system wait --for=condition=available --timeout=2m deploy/controller
+          SUBNET=$(docker network inspect kind | jq -r '.[0].IPAM.Config[0].Subnet')
+          PREFIX=$(echo $SUBNET | sed 's|\.0\.0/16|.255.|')
+          cat <<EOF | kubectl apply -f -
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata: { name: pool, namespace: metallb-system }
+          spec: { addresses: ["${PREFIX}200-${PREFIX}250"] }
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata: { name: adv, namespace: metallb-system }
+          EOF
+      - name: Install csi-driver-nfs + in-pod NFS server
+        run: |
+          helm repo add csi-driver-nfs https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
+          helm install csi-driver-nfs csi-driver-nfs/csi-driver-nfs -n kube-system --version v4.11.0 --wait
+          kubectl apply -f hack/manifests/in-pod-nfs-server.yaml
+          kubectl -n kube-system wait --for=condition=available --timeout=2m deploy/nfs-server
+      - name: Build operator + fake ark images
+        run: |
+          make docker-build IMG=ark-asa-operator:dev
+          make docker-build-fake
+          kind load docker-image ark-asa-operator:dev fake-ark-server:dev --name e2e
+      - name: Helm install operator
+        run: |
+          helm install op deploy/helm/ark-asa-operator/ -n ark-operator --create-namespace \
+            --set image.repository=ark-asa-operator --set image.tag=dev --set webhook.enabled=false --wait
+      - name: Run e2e
+        run: make e2e

@@ -261,3 +261,7 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+.PHONY: e2e
+e2e: ## Run e2e tests against the current KUBECONFIG (kind in CI).
+	go test -tags=e2e -count=1 ./test/e2e/... -timeout 30m
