@@ -265,3 +265,7 @@ endef
 .PHONY: e2e
 e2e: ## Run e2e tests against the current KUBECONFIG (kind in CI).
 	go test -tags=e2e -count=1 ./test/e2e/... -timeout 30m
+
+.PHONY: image-contract
+image-contract: ## Verify the upstream sknnr image still meets our env-var contract.
+	go test -count=1 ./test/image-contract/... -v
