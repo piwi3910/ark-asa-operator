@@ -10,6 +10,7 @@ linters:
     - ginkgolinter
     - goconst
     - gocyclo
+    - gosec
     - govet
     - ineffassign
     - lll
@@ -52,6 +53,7 @@ linters:
 formatters:
   enable:
     - gofmt
+    - gofumpt
     - goimports
   exclusions:
     generated: lax
