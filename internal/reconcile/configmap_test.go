@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	arkv1 "github.com/piwi3910/ark-asa-operator/api/v1alpha1"
@@ -52,7 +53,8 @@ func TestEnsureMapINIConfigMapsFromMapSpec(t *testing.T) {
 	cluster := &arkv1.ArkCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
 		Spec: arkv1.ArkClusterSpec{
-			Maps: []arkv1.MapSpec{{ID: "TheIsland_WP", GameUserSettings: &arkv1.ConfigMapRef{Name: "src-gus"}}},
+			Maps:    []arkv1.MapSpec{{ID: "TheIsland_WP", GameUserSettings: &arkv1.ConfigMapRef{Name: "src-gus"}}},
+			Service: arkv1.ServiceSpec{RconPortStart: 27020},
 		},
 	}
 	c := newFake(t).WithObjects(src).Build()
@@ -61,9 +63,12 @@ func TestEnsureMapINIConfigMapsFromMapSpec(t *testing.T) {
 	}
 	gus := &corev1.ConfigMap{}
 	_ = c.Get(context.Background(), types.NamespacedName{Name: "c-island-gus", Namespace: "ns"}, gus)
-	want := "[ServerSettings]\nDifficultyOffset=1.0\n"
-	if gus.Data["GameUserSettings.ini"] != want {
-		t.Errorf("GUS content not copied: got %q want %q", gus.Data["GameUserSettings.ini"], want)
+	got := gus.Data["GameUserSettings.ini"]
+	if !strings.Contains(got, "DifficultyOffset=1.0") {
+		t.Errorf("user GUS content not preserved: %q", got)
+	}
+	if !strings.Contains(got, "RCONEnabled=True") || !strings.Contains(got, "RCONPort=27020") {
+		t.Errorf("RCON defaults not injected: %q", got)
 	}
 }
 
@@ -85,7 +90,43 @@ func TestEnsureMapINIConfigMapsGlobalFallback(t *testing.T) {
 	}
 	gus := &corev1.ConfigMap{}
 	_ = c.Get(context.Background(), types.NamespacedName{Name: "c-island-gus", Namespace: "ns"}, gus)
-	if gus.Data["GameUserSettings.ini"] != "[ServerSettings]\nGlobal=1\n" {
-		t.Errorf("global fallback not applied: %q", gus.Data["GameUserSettings.ini"])
+	got := gus.Data["GameUserSettings.ini"]
+	if !strings.Contains(got, "Global=1") {
+		t.Errorf("global fallback not applied: %q", got)
+	}
+	if !strings.Contains(got, "RCONEnabled=True") {
+		t.Errorf("RCON defaults not injected: %q", got)
+	}
+}
+
+func TestEnsureGUSDefaultsAddsMissing(t *testing.T) {
+	got := ensureGUSDefaults("", 27020)
+	if !strings.Contains(got, "RCONEnabled=True") || !strings.Contains(got, "RCONPort=27020") {
+		t.Errorf("missing defaults in: %q", got)
+	}
+	if !strings.Contains(got, "[ServerSettings]") {
+		t.Errorf("missing section header in: %q", got)
+	}
+}
+
+func TestEnsureGUSDefaultsRespectsUserKeys(t *testing.T) {
+	user := "[ServerSettings]\nRCONEnabled=True\nRCONPort=99999\nDifficultyOffset=1.0\n"
+	got := ensureGUSDefaults(user, 27020)
+	if !strings.Contains(got, "RCONPort=99999") {
+		t.Errorf("user RCONPort overridden: %q", got)
+	}
+	if strings.Count(got, "RCONPort=") != 1 {
+		t.Errorf("duplicate RCONPort lines: %q", got)
+	}
+}
+
+func TestEnsureGUSDefaultsInjectsSectionIfMissing(t *testing.T) {
+	user := "[Some/Other.Section]\nKey=Val\n"
+	got := ensureGUSDefaults(user, 27020)
+	if !strings.Contains(got, "[ServerSettings]") {
+		t.Error("section header not prepended")
+	}
+	if !strings.Contains(got, "RCONEnabled=True") {
+		t.Error("RCONEnabled not injected")
 	}
 }

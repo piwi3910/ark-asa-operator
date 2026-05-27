@@ -157,7 +157,7 @@ spec:
                     type: string
                 type: object
               image:
-                default: ghcr.io/sknnr/ark-ascended-server:latest
+                default: docker.io/sknnr/ark-ascended-server:latest
                 type: string
               maps:
                 items:

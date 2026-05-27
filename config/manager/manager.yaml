@@ -63,8 +63,12 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
-        image: controller:latest
+        image: ark-asa-operator:dev
+        imagePullPolicy: IfNotPresent
         name: manager
+        env:
+        - name: ENABLE_WEBHOOKS
+          value: "false"
         ports:
         - containerPort: 8081
           name: health

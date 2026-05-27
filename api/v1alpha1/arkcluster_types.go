@@ -34,7 +34,7 @@ type ArkClusterList struct {
 
 // ArkClusterSpec is the desired state.
 type ArkClusterSpec struct {
-	// +kubebuilder:default="ghcr.io/sknnr/ark-ascended-server:latest"
+	// +kubebuilder:default="docker.io/sknnr/ark-ascended-server:latest"
 	Image string `json:"image,omitempty"`
 
 	// +kubebuilder:validation:Required

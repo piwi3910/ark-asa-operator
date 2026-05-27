@@ -60,10 +60,21 @@ func BuildServerPod(in PodInput) *corev1.Pod {
 
 	image := cluster.Spec.Image
 	if image == "" {
-		image = "ghcr.io/sknnr/ark-ascended-server:latest"
+		image = "docker.io/sknnr/ark-ascended-server:latest"
 	}
 
 	tgps := int64(1800)
+	psc := cluster.Spec.PodSecurityContext
+	if psc == nil {
+		uid := int64(10000)
+		gid := int64(10000)
+		fsg := int64(10000)
+		psc = &corev1.PodSecurityContext{
+			RunAsUser:  &uid,
+			RunAsGroup: &gid,
+			FSGroup:    &fsg,
+		}
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      PodName(cluster.Name, in.MapID, in.Hash),
@@ -79,7 +90,7 @@ func BuildServerPod(in PodInput) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			RestartPolicy:                 corev1.RestartPolicyAlways,
 			TerminationGracePeriodSeconds: &tgps,
-			SecurityContext:               cluster.Spec.PodSecurityContext,
+			SecurityContext:               psc,
 			NodeSelector:                  cluster.Spec.NodeSelector,
 			Tolerations:                   cluster.Spec.Tolerations,
 			Containers: []corev1.Container{

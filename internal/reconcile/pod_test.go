@@ -112,3 +112,30 @@ func TestBuildServerPodVolumeMountsUseSlug(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildServerPodDefaultsPodSecurityContext(t *testing.T) {
+	cluster := &arkv1.ArkCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec:       arkv1.ArkClusterSpec{ClusterID: "c"},
+	}
+	pod := BuildServerPod(PodInput{Cluster: cluster, MapID: "TheIsland_WP", ActiveVolume: "server-a"})
+	psc := pod.Spec.SecurityContext
+	if psc == nil || psc.FSGroup == nil || *psc.FSGroup != 10000 {
+		t.Errorf("expected default fsGroup=10000 (sknnr image UID); got %+v", psc)
+	}
+	if psc.RunAsUser == nil || *psc.RunAsUser != 10000 {
+		t.Errorf("expected default runAsUser=10000; got %+v", psc.RunAsUser)
+	}
+}
+
+func TestBuildServerPodHonorsPodSecurityContext(t *testing.T) {
+	uid := int64(2000)
+	cluster := &arkv1.ArkCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec:       arkv1.ArkClusterSpec{ClusterID: "c", PodSecurityContext: &corev1.PodSecurityContext{RunAsUser: &uid}},
+	}
+	pod := BuildServerPod(PodInput{Cluster: cluster, MapID: "TheIsland_WP", ActiveVolume: "server-a"})
+	if pod.Spec.SecurityContext == nil || pod.Spec.SecurityContext.RunAsUser == nil || *pod.Spec.SecurityContext.RunAsUser != 2000 {
+		t.Error("user-provided PodSecurityContext was not honored")
+	}
+}
