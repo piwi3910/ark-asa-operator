@@ -6406,3 +6406,345 @@ This is the spec self-check at the end of plan writing, not an exhaustive QA.
 - Phase 4 (5 tasks): CurseForge mod polling.
 
 Each task is TDD-shaped (write test → red → implement → green → commit). Total estimated commits: ~50.
+
+---
+
+## Plan Amendments (post-review fixes)
+
+This addendum patches five issues caught during review. Apply these *as you reach the relevant task* during execution; they're keyed to existing tasks rather than being separate phases.
+
+### Amendment A — Map slugification (applies to Phase 1 onward, all resource naming)
+
+**Problem:** `mapID` values like `TheIsland_WP` contain uppercase letters and underscores and cannot be used directly in Kubernetes resource names (must be DNS-1123: `[a-z0-9-]`). All `*Name(cluster, mapID, ...)` helpers in `internal/reconcile/` are affected.
+
+**Fix — new file:**
+
+```go
+// internal/ark/slug.go
+package ark
+
+import (
+	"regexp"
+	"strings"
+)
+
+// MapSlug returns a DNS-1123-compatible slug for a given ARK map ID.
+// Known canonical maps are mapped to friendly short slugs; everything else falls
+// back to lowercase + underscore-to-dash + strip non-alphanumeric runs.
+func MapSlug(mapID string) string {
+	switch mapID {
+	case "TheIsland_WP":
+		return "island"
+	case "ScorchedEarth_WP":
+		return "scorched-earth"
+	case "Aberration_WP":
+		return "aberration"
+	case "Extinction_WP":
+		return "extinction"
+	case "TheCenter_WP":
+		return "the-center"
+	case "Astraeos_WP":
+		return "astraeos"
+	case "BobsMissions_WP":
+		return "club-ark"
+	}
+	s := strings.ToLower(mapID)
+	s = strings.TrimSuffix(s, "_wp")
+	s = strings.ReplaceAll(s, "_", "-")
+	s = nonAlphanumDashRun.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	return s
+}
+
+var nonAlphanumDashRun = regexp.MustCompile(`[^a-z0-9-]+`)
+```
+
+```go
+// internal/ark/slug_test.go
+package ark
+
+import "testing"
+
+func TestMapSlug(t *testing.T) {
+	tests := map[string]string{
+		"TheIsland_WP":     "island",
+		"ScorchedEarth_WP": "scorched-earth",
+		"BobsMissions_WP":  "club-ark",
+		"My_Custom_Map_WP": "my-custom-map",
+		"weirdMod_v2":      "weirdmod-v2",
+	}
+	for in, want := range tests {
+		if got := MapSlug(in); got != want {
+			t.Errorf("MapSlug(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+```
+
+**Apply at:** add this file alongside Task 1.3 (port allocation). Commit message: `feat(ark): map ID slugification for DNS-1123-compatible resource names`.
+
+**Then propagate** — replace every occurrence of `mapID` in resource-name construction with `ark.MapSlug(mapID)`:
+
+| File / function | Original | Replace with |
+|---|---|---|
+| `internal/reconcile/pvc.go` `PVCNameSaves`, `PVCNameServer` | `mapID` in `fmt.Sprintf(...)` | `ark.MapSlug(mapID)` |
+| `internal/reconcile/service.go` `ServiceName` | `mapID` | `ark.MapSlug(mapID)` |
+| `internal/reconcile/configmap.go` `GUSConfigMapName`, `GameConfigMapName` | `mapID` | `ark.MapSlug(mapID)` |
+| `internal/reconcile/job.go` `InitJobName` | `mapID` | `ark.MapSlug(mapID)` |
+| `internal/reconcile/pod.go` `PodName` | `mapID` | `ark.MapSlug(mapID)` |
+| Pod label `ark.watteel.com/map` (in `BuildServerPod`) | `mapID` | `ark.MapSlug(mapID)` |
+| Pod selector match in Service (`internal/reconcile/service.go`) | `mapID` | `ark.MapSlug(mapID)` |
+| Pod list filter in `listMapPods` (`internal/controller/arkcluster_controller.go`) | `mapID` | `ark.MapSlug(mapID)` |
+| GC `keep` map keys in `gcOrphanedMaps` | `m.ID` | `ark.MapSlug(m.ID)` |
+
+**Env vars and ARK flags keep the raw `mapID`** — `SERVER_MAP=TheIsland_WP` is what ARK needs.
+
+Update the tests in Tasks 1.7, 1.8, 1.10, 1.11 to use lowercase map IDs in their `mapID` arg or to expect the slug in resource names. E.g.:
+- `TestEnsureServiceCreatesLoadBalancer` builds the cluster with `Maps: []arkv1.MapSpec{{ID: "TheIsland_WP"}}`, calls `EnsureService(..., "TheIsland_WP", 0)`, then expects `c.Get(... "piwis-place-island" ...)` (not `piwis-place-TheIsland_WP`).
+
+### Amendment B — Pod template hash includes ConfigMap and Secret revisions
+
+**Problem:** `IniRev` and `SecretsRev` fields exist in `PodTemplateHashInput` but `computePodHash` never populates them. User-edits to GUS/Game.ini ConfigMaps or password Secrets won't trigger a roll.
+
+**Fix:** in `internal/controller/arkcluster_controller.go`, update `computePodHash` to take a `client.Client` + `context.Context` and fetch the relevant resource versions:
+
+```go
+func (r *ArkClusterReconciler) computePodHash(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, i int, activeVolume string) string {
+	mods := cluster.Spec.GlobalSettings.Mods
+	if len(mapSpec.Mods) > 0 {
+		mods = mapSpec.Mods
+	}
+	slug := ark.MapSlug(mapSpec.ID)
+
+	// Aggregate revisions of every referenced ConfigMap/Secret so changes trigger a roll.
+	iniRev := r.readResourceVersion(ctx, cluster.Namespace, "ConfigMap", reconcile.GUSConfigMapName(cluster.Name, slug)) +
+		"|" + r.readResourceVersion(ctx, cluster.Namespace, "ConfigMap", reconcile.GameConfigMapName(cluster.Name, slug))
+
+	secretsRev := r.readResourceVersion(ctx, cluster.Namespace, "Secret", reconcile.SecretsName(cluster.Name))
+	if cluster.Spec.GlobalSettings.ServerPassword != nil {
+		secretsRev += "|" + r.readResourceVersion(ctx, cluster.Namespace, "Secret", cluster.Spec.GlobalSettings.ServerPassword.Name)
+	}
+
+	return ark.PodTemplateHash(ark.PodTemplateHashInput{
+		Image:        cluster.Spec.Image,
+		Mods:         mods,
+		GamePort:     ark.GamePort(cluster.Spec.Service.GamePortStart, i),
+		RconPort:     ark.RconPort(cluster.Spec.Service.RconPortStart, i),
+		ActiveVolume: activeVolume,
+		IniRev:       iniRev,
+		SecretsRev:   secretsRev,
+	})
+}
+
+func (r *ArkClusterReconciler) readResourceVersion(ctx context.Context, ns, kind, name string) string {
+	obj := unstructuredOf(kind)
+	if obj == nil {
+		return ""
+	}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, obj); err != nil {
+		return "" // missing → treated as no revision; pod will be rolled when it appears
+	}
+	return obj.GetResourceVersion()
+}
+
+func unstructuredOf(kind string) client.Object {
+	switch kind {
+	case "ConfigMap":
+		return &corev1.ConfigMap{}
+	case "Secret":
+		return &corev1.Secret{}
+	}
+	return nil
+}
+```
+
+Update every call site of `computePodHash` to pass `(ctx, cluster, mapSpec, i, activeVolume)` and to be a method on the reconciler (`r.computePodHash`).
+
+Add a unit test in `arkcluster_controller_test.go` (envtest):
+
+```go
+It("rolls the pod when GameUserSettings ConfigMap content changes", func() {
+	// create cluster + wait for Running
+	// patch the gus ConfigMap's data
+	// assert: pod is replaced within ~30s
+})
+```
+
+**Apply at:** Task 1.16 (initial wiring) and re-verify in Task 2.3 (rollUpdate uses the same helper).
+
+### Amendment C — CurseForge client must send the request body
+
+**Problem:** in `internal/curseforge/client.go` `GetFiles`:
+
+```go
+body, _ := json.Marshal(map[string]any{"modIds": ids})
+req, _ := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/mods", nil)
+req.Body = http.NoBody   // BUG
+_ = body                  // never sent
+```
+
+`body` is computed but the request goes out with no body. CurseForge will respond 400 or treat as an empty mod list.
+
+**Fix:**
+
+```go
+import "bytes"
+// ...
+body, err := json.Marshal(map[string]any{"modIds": ids})
+if err != nil {
+	return nil, fmt.Errorf("marshal modIds: %w", err)
+}
+req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/v1/mods", bytes.NewReader(body))
+if err != nil {
+	return nil, err
+}
+req.Header.Set("x-api-key", c.apiKey)
+req.Header.Set("Content-Type", "application/json")
+req.Header.Set("Accept", "application/json")
+// (remove the req.Body = http.NoBody and _ = body lines entirely)
+```
+
+Update `TestGetFiles` to verify the request body has the modIds:
+
+```go
+func TestGetFiles(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		// then delegate to fake.Handler
+		fake.Handler(map[int64]fake.Mod{927090: {Slug: "structures-plus", LatestFileID: 4912100, LatestVersion: "5.5.0"}})(w, r)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "api-key-stub", nil)
+	got, err := c.GetFiles(context.Background(), []int64{927090})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(gotBody, []byte(`"modIds"`)) || !bytes.Contains(gotBody, []byte("927090")) {
+		t.Errorf("request body missing modIds; got %s", gotBody)
+	}
+	if len(got) != 1 || got[927090].LatestFileID != 4912100 {
+		t.Errorf("unexpected: %+v", got)
+	}
+}
+```
+
+**Apply at:** Task 4.1.
+
+### Amendment D — Init Job naming keyed on install-relevant hash
+
+**Problem:** `InitJobName` includes `generation`. Unrelated spec patches that increment `cluster.Generation` mid-roll cause the controller to create a second init Job for the same volume; the second blocks on the RWO PVC the first holds.
+
+**Fix:** key the init Job name on a hash of inputs that actually affect the install — image + ARK app ID — not generation.
+
+```go
+// internal/reconcile/job.go
+import (
+	"crypto/sha256"
+	"encoding/hex"
+)
+
+// installIdentity returns a short hex digest of inputs that determine what gets installed.
+// Stable across unrelated spec changes (e.g., resource limits, port renames).
+func installIdentity(cluster *arkv1.ArkCluster) string {
+	image := cluster.Spec.Image
+	if image == "" {
+		image = "ghcr.io/sknnr/ark-ascended-server:latest"
+	}
+	sum := sha256.Sum256([]byte(image + "|2430930")) // ARK SA dedicated server app ID
+	return hex.EncodeToString(sum[:4])
+}
+
+func InitJobName(cluster *arkv1.ArkCluster, mapID, side string) string {
+	return fmt.Sprintf("%s-%s-init-%s-%s", cluster.Name, ark.MapSlug(mapID), side, installIdentity(cluster))
+}
+```
+
+Change `EnsureInitJob` and `InitJobStatus` to take `cluster *arkv1.ArkCluster` instead of `cluster, mapID, side, generation` (with the new `InitJobName(cluster, ...)` doing the hashing internally). Drop the `generation` parameter from all callers in `arkcluster_controller.go` (`rollUpdate` and `firstStart`).
+
+Add a test:
+
+```go
+func TestInitJobNameStableAcrossGenerations(t *testing.T) {
+	cluster := &arkv1.ArkCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "n", Generation: 1},
+		Spec:       arkv1.ArkClusterSpec{Image: "img:v1"},
+	}
+	first := InitJobName(cluster, "TheIsland_WP", "b")
+	cluster.Generation = 99
+	second := InitJobName(cluster, "TheIsland_WP", "b")
+	if first != second {
+		t.Errorf("name must not depend on generation: %s vs %s", first, second)
+	}
+}
+
+func TestInitJobNameChangesOnImageChange(t *testing.T) {
+	c1 := &arkv1.ArkCluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "n"}, Spec: arkv1.ArkClusterSpec{Image: "img:v1"}}
+	c2 := &arkv1.ArkCluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "n"}, Spec: arkv1.ArkClusterSpec{Image: "img:v2"}}
+	if InitJobName(c1, "Island_WP", "a") == InitJobName(c2, "Island_WP", "a") {
+		t.Error("name must change when image changes")
+	}
+}
+```
+
+**Apply at:** Task 2.1 (job.go) + Task 2.3 (rollUpdate, firstStart).
+
+### Amendment E — friendlyName fallback for unknown maps
+
+**Problem:** `friendlyName` returns the raw ID for any map not in the hardcoded switch. `MyCommunityMap_WP` becomes the session-name fragment as-is.
+
+**Fix:** add a fallback that strips `_WP` and splits CamelCase. In `internal/controller/arkcluster_controller.go`:
+
+```go
+import "regexp"
+
+var camelCaseSplit = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+
+func friendlyName(mapID string) string {
+	switch mapID {
+	case "TheIsland_WP":      return "The Island"
+	case "ScorchedEarth_WP":  return "Scorched Earth"
+	case "Aberration_WP":     return "Aberration"
+	case "Extinction_WP":     return "Extinction"
+	case "TheCenter_WP":      return "The Center"
+	case "Astraeos_WP":       return "Astraeos"
+	case "BobsMissions_WP":   return "Club Ark"
+	}
+	s := strings.TrimSuffix(mapID, "_WP")
+	s = camelCaseSplit.ReplaceAllString(s, "$1 $2")
+	return s
+}
+```
+
+Add a test:
+
+```go
+func TestFriendlyNameFallback(t *testing.T) {
+	tests := map[string]string{
+		"MyCustomMap_WP":   "My Custom Map",
+		"PangeaMap_v3_WP":  "Pangea Map_v3",   // underscores in middle preserved
+		"weirdLowerCamel":  "weird Lower Camel",
+	}
+	for in, want := range tests {
+		if got := friendlyName(in); got != want {
+			t.Errorf("friendlyName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+```
+
+**Apply at:** Task 1.16.
+
+---
+
+### Cumulative impact
+
+After applying A–E, the affected commit count grows by ~5 (one per amendment). Each amendment is a small, focused commit that can be applied just before the task it pertains to:
+
+- A goes in just before Task 1.7 (first place we use map IDs in resource names)
+- B goes in inside Task 1.16
+- C goes in inside Task 4.1
+- D goes in inside Task 2.1
+- E goes in inside Task 1.16
+
+No phase exit criteria change.
