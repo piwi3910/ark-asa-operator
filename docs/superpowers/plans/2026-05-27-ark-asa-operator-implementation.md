@@ -6964,3 +6964,342 @@ It("survives operator restart mid-rollback (status persisted, pod not yet delete
 **Apply at:** Task 2.3 (replaces the rollUpdate and rollback bodies); add tests as Task 2.5 (alongside the existing AngellusMortis regression test).
 
 **Impact:** one additional `persistStatus` call per drain start, per swap, per rollback. Adds at most ~50ms per transition (one API call). Cheap insurance against a class of subtle bugs.
+
+### Amendment G — Helm CRD upgrade hook, externalTrafficPolicy default, envtest pod simulator
+
+#### G.1 — Helm CRD upgrade hook
+
+**Problem:** Helm's `crds/` directory installs CRDs only on `helm install`. `helm upgrade` ignores the directory entirely. Users will silently run on stale CRDs after operator upgrades unless they remember to `kubectl apply` the new CRD manually.
+
+**Fix:** add a pre-upgrade Helm hook Job that uses an ephemeral `bitnami/kubectl` pod to apply the latest CRD bundled with the chart. The CRD body lives in a ConfigMap that is also rendered by the chart (so it tracks the chart version exactly).
+
+Add `deploy/helm/ark-asa-operator/templates/crd-upgrade-hook.yaml`:
+
+```yaml
+{{- if .Values.installCRDs }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+data:
+  arkcluster.yaml: |-
+{{ .Files.Get "crds/ark.watteel.com_arkclusters.yaml" | indent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-apply
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+      containers:
+        - name: kubectl
+          image: bitnami/kubectl:1.31
+          command: ["/bin/sh", "-c"]
+          args:
+            - kubectl apply --server-side --force-conflicts -f /crd/arkcluster.yaml
+          volumeMounts:
+            - name: crd
+              mountPath: /crd
+      volumes:
+        - name: crd
+          configMap:
+            name: {{ include "ark-asa-operator.fullname" . }}-crd
+{{- end }}
+```
+
+The hook fires on both `pre-install` and `pre-upgrade`, applies the CRD with `--server-side --force-conflicts` (the idiomatic upgrade-safe path), then deletes itself. With this in place, `helm upgrade` keeps the CRD in sync.
+
+**Drop the chart's `crds/` directory** — that path is now redundant and would conflict with the hook on initial install. The CRD file lives at `deploy/helm/ark-asa-operator/crds/ark.watteel.com_arkclusters.yaml` only so that `.Files.Get` in the ConfigMap can read it; rename the directory to `files/` to avoid Helm's special handling:
+
+```bash
+git mv deploy/helm/ark-asa-operator/crds deploy/helm/ark-asa-operator/files
+# Update the path in the ConfigMap above from "crds/..." to "files/..." accordingly.
+```
+
+Then in the ConfigMap template change:
+```
+{{ .Files.Get "files/ark.watteel.com_arkclusters.yaml" | indent 4 }}
+```
+
+Update `docs/installation.md` "CRD upgrades" section to say:
+
+> The chart applies CRDs via a `pre-install,pre-upgrade` hook, so `helm upgrade` keeps the CRD in sync with the operator version. No manual `kubectl apply` step required.
+
+**Apply at:** Task 1.19 (chart) — add the new template, move `crds/` to `files/`. Task 1.23 (installation docs) — replace the CRD-upgrade caveat with the new behavior.
+
+#### G.2 — externalTrafficPolicy defaults to Cluster (with spec opt-in for Local)
+
+**Problem:** the design defaults service `externalTrafficPolicy: Local` to preserve client IPs. On single-node novanas this is fine. On multi-node clusters, ServiceLB-style VIPs bind to one node — if the ARK pod schedules on a different node, traffic is silently dropped. ARK SA doesn't actually need real client IPs (BattlEye disabled by default, player identity comes from Steam tickets), so Cluster is the safer default.
+
+**Fix (spec):** add a field to `ServiceSpec`:
+
+```go
+// In api/v1alpha1/arkcluster_types.go (in ServiceSpec)
+// +kubebuilder:default="Cluster"
+// +kubebuilder:validation:Enum=Cluster;Local
+ExternalTrafficPolicy corev1.ServiceExternalTrafficPolicy `json:"externalTrafficPolicy,omitempty"`
+```
+
+**Fix (reconcile/service.go):** stop hardcoding Local. Use the spec value:
+
+```go
+// Replace the existing:
+if svcType == corev1.ServiceTypeLoadBalancer {
+	svc.Spec.ExternalTrafficPolicy = corev1.ServiceExternalTrafficPolicyLocal
+	if mapIndex < len(cluster.Spec.Service.LoadBalancerIPs) {
+		svc.Spec.LoadBalancerIP = cluster.Spec.Service.LoadBalancerIPs[mapIndex]
+	}
+}
+
+// With:
+if svcType == corev1.ServiceTypeLoadBalancer {
+	etp := cluster.Spec.Service.ExternalTrafficPolicy
+	if etp == "" {
+		etp = corev1.ServiceExternalTrafficPolicyCluster // safer default
+	}
+	svc.Spec.ExternalTrafficPolicy = etp
+	if mapIndex < len(cluster.Spec.Service.LoadBalancerIPs) {
+		svc.Spec.LoadBalancerIP = cluster.Spec.Service.LoadBalancerIPs[mapIndex]
+	}
+}
+```
+
+**Fix (existing tests):** the test `TestEnsureServiceCreatesLoadBalancer` asserts `externalTrafficPolicy == Local`. Flip the assertion to `Cluster` (default) and add a second test for the opt-in:
+
+```go
+func TestEnsureServiceHonorsExternalTrafficPolicyOptIn(t *testing.T) {
+	cluster := &arkv1.ArkCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"},
+		Spec: arkv1.ArkClusterSpec{
+			Service: arkv1.ServiceSpec{
+				Type: corev1.ServiceTypeLoadBalancer,
+				GamePortStart: 7777, RconPortStart: 27020,
+				ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyLocal,
+			},
+		},
+	}
+	c := newFake(t).Build()
+	_ = EnsureService(context.Background(), c, cluster, "TheIsland_WP", 0)
+	got := &corev1.Service{}
+	_ = c.Get(context.Background(), types.NamespacedName{Name: "c-island", Namespace: "ns"}, got)
+	if got.Spec.ExternalTrafficPolicy != corev1.ServiceExternalTrafficPolicyLocal {
+		t.Errorf("opt-in not honored: %s", got.Spec.ExternalTrafficPolicy)
+	}
+}
+```
+
+**Update spec §8.1** — change the default in the YAML snippet from `externalTrafficPolicy: Local` to `externalTrafficPolicy: Cluster` and add a note: "ARK SA uses Steam tickets for player identity, so client IP preservation is not required. Single-node clusters can opt back into `Local` to keep the cleaner topology, but multi-node clusters should leave it at the default."
+
+**Apply at:** Task 1.2 (CRD types — add field), Task 1.8 (Service ensure + tests). Update spec §8.1 inline.
+
+#### G.3 — envtest pod simulator helper for lifecycle tests
+
+**Problem:** envtest spins up kube-apiserver + etcd but not kubelet. Pods created in envtest stay `Pending` forever; their `ContainerStatuses`, `ReadinessProbe` results, restart counters, etc. are all empty. Our existing envtest in Task 1.16 only verifies that resources are *created* — it can't exercise paths that depend on pod state (readiness, restart-on-crash, drain-on-update).
+
+**Fix:** add an envtest helper (`internal/controller/podstate_test_helper.go`, build tag `//go:build envtest` so it doesn't ship in production binaries) that patches pod status directly to simulate kubelet-like transitions.
+
+```go
+//go:build envtest
+
+// internal/controller/podstate_test_helper.go
+package controller
+
+import (
+	"context"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// SimulatePodReady patches a pod's status so the reconciler sees it as Running + Ready.
+// Used in envtest where there's no kubelet.
+func SimulatePodReady(ctx context.Context, c client.Client, pod *corev1.Pod) error {
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()},
+		{Type: corev1.PodInitialized, Status: corev1.ConditionTrue},
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+	}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		{Name: "ark", Ready: true, RestartCount: 0,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}}},
+	}
+	return c.Status().Update(ctx, pod)
+}
+
+// SimulatePodCrashLoop patches a pod's status to look like it's in CrashLoopBackOff
+// with restartCount=4 and lastTerminationState.exitCode != 0.
+func SimulatePodCrashLoop(ctx context.Context, c client.Client, pod *corev1.Pod) error {
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:         "ark",
+		Ready:        false,
+		RestartCount: 4,
+		State: corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+		},
+		LastTerminationState: corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   1,
+				Reason:     "Error",
+				StartedAt:  metav1.NewTime(time.Now().Add(-time.Minute)),
+				FinishedAt: metav1.NewTime(time.Now().Add(-10 * time.Second)),
+			},
+		},
+	}}
+	return c.Status().Update(ctx, pod)
+}
+
+// SimulateJobSucceeded patches a Job's status to look complete.
+func SimulateJobSucceeded(ctx context.Context, c client.Client, key client.ObjectKey) error {
+	var job batchv1.Job
+	if err := c.Get(ctx, key, &job); err != nil {
+		return err
+	}
+	job.Status.Succeeded = 1
+	job.Status.Conditions = []batchv1.JobCondition{
+		{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()},
+	}
+	return c.Status().Update(ctx, &job)
+}
+```
+
+**Add envtest build tag** to the existing `suite_test.go` and to the new helper. Modify Makefile target:
+
+```makefile
+.PHONY: test-envtest
+test-envtest:
+	go test -tags envtest ./internal/controller/... -coverprofile cover.out
+```
+
+**New comprehensive envtest** in `internal/controller/arkcluster_controller_test.go` exercising the full lifecycle (append):
+
+```go
+It("walks the full happy-path lifecycle (Pending → Provisioning → Running → Updating → Running)", func() {
+	ns := "default"
+	ac := &arkv1.ArkCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "lifecycle", Namespace: ns},
+		Spec: arkv1.ArkClusterSpec{
+			ClusterID: "lc", Image: "fake-ark-server:dev",
+			Maps:    []arkv1.MapSpec{{ID: "TheIsland_WP"}},
+			Service: arkv1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, GamePortStart: 7777, RconPortStart: 27020, ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster},
+			Storage: arkv1.StorageSpec{ServerPVCSize: "1Gi", SavesPVCSize: "1Gi", ClusterPVCSize: "1Gi", ClusterStorageClass: "standard"},
+			UpdateStrategy: arkv1.UpdateStrategy{Type: arkv1.UpdateStrategyBlueGreen, GracefulShutdown: metav1.Duration{Duration: 0}, Rollout: arkv1.RolloutOneAtATime},
+		},
+	}
+	Expect(k8sClient.Create(ctx, ac)).To(Succeed())
+
+	// Reach Provisioning: PVCs created, init Job pending
+	Eventually(func() arkv1.MapPhase {
+		got := &arkv1.ArkCluster{}; _ = k8sClient.Get(ctx, client.ObjectKeyFromObject(ac), got)
+		if len(got.Status.Maps) == 0 { return "" }
+		return got.Status.Maps[0].Phase
+	}, 10*time.Second, 200*time.Millisecond).Should(BeElementOf(arkv1.MapPhaseProvisioning, arkv1.MapPhaseInstallingActive))
+
+	// Simulate init Job complete
+	Eventually(func() error {
+		jobs := &batchv1.JobList{}
+		_ = k8sClient.List(ctx, jobs, client.InNamespace(ns))
+		if len(jobs.Items) == 0 { return fmt.Errorf("no job") }
+		return SimulateJobSucceeded(ctx, k8sClient, client.ObjectKeyFromObject(&jobs.Items[0]))
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+
+	// Simulate pod becoming Ready
+	Eventually(func() error {
+		pods := &corev1.PodList{}
+		_ = k8sClient.List(ctx, pods, client.InNamespace(ns), client.MatchingLabels{"ark.watteel.com/cluster": "lifecycle"})
+		if len(pods.Items) == 0 { return fmt.Errorf("no pod") }
+		return SimulatePodReady(ctx, k8sClient, &pods.Items[0])
+	}, 10*time.Second, 200*time.Millisecond).Should(Succeed())
+
+	// Cluster transitions to Running
+	Eventually(func() arkv1.ClusterPhase {
+		got := &arkv1.ArkCluster{}; _ = k8sClient.Get(ctx, client.ObjectKeyFromObject(ac), got)
+		return got.Status.Phase
+	}, 30*time.Second, 200*time.Millisecond).Should(Equal(arkv1.ClusterPhaseRunning))
+
+	// Trigger update by patching image
+	patch := client.MergeFrom(ac.DeepCopy())
+	ac.Spec.Image = "fake-ark-server:dev-v2"
+	Expect(k8sClient.Patch(ctx, ac, patch)).To(Succeed())
+
+	// Wait for blue/green to begin: new init Job for the inactive (b) side appears
+	Eventually(func() int {
+		jobs := &batchv1.JobList{}
+		_ = k8sClient.List(ctx, jobs, client.InNamespace(ns), client.MatchingLabels{"ark.watteel.com/side": "b"})
+		return len(jobs.Items)
+	}, 30*time.Second, 200*time.Millisecond).Should(Equal(1))
+})
+
+It("auto-rolls back when the new pod CrashLoops", func() {
+	// Setup: create cluster, drive to Running, trigger update, fast-forward to a server-b pod existing
+	// Then call SimulatePodCrashLoop on the server-b pod.
+	// Wait for the reconciler to detect crashloop and roll back.
+	// Verify: status.maps[0].activeVolume == "server-a" and RollbackOccurred condition is True.
+})
+```
+
+**Apply at:** Task 1.16 (add the helper and tag) + new Task 1.16a section just after.
+
+#### Cumulative impact of Amendment G
+
+- One new chart template (CRD upgrade hook) + a chart directory rename (`crds/` → `files/`).
+- One new spec field (`ExternalTrafficPolicy`) and one default flip in the Service reconciler.
+- One new envtest helper file (gated by build tag) and 2 new lifecycle tests.
+- No new external dependencies; the upgrade-hook image is a stock `bitnami/kubectl`.
+- Three more named regression tests, bringing the total to ~6.

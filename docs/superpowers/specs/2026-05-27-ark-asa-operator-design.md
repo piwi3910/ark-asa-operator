@@ -388,11 +388,11 @@ type: LoadBalancer
 ports:
   - { name: game, port: 7777, targetPort: 7777, protocol: UDP }
   - { name: rcon, port: 27020, targetPort: 27020, protocol: TCP }
-externalTrafficPolicy: Local        # preserve client source IP for ARK
+externalTrafficPolicy: Cluster      # default; override per ArkCluster via spec.service.externalTrafficPolicy
 loadBalancerIP: <pinned or omit>
 ```
 
-`externalTrafficPolicy: Local` because ARK uses client IPs. Trade-off: on multi-node clusters, pods must be scheduled on a node where the LB advertises. On single-node novanas, no consequence.
+Default `externalTrafficPolicy: Cluster`. ARK SA authenticates players via Steam tickets, not source IPs (BattlEye disabled by default in this operator), so preserving client IPs is not a feature requirement. Cluster mode also works correctly on multi-node clusters where the LB-advertising node and the pod's node may differ. Opt back into `Local` per ArkCluster via `spec.service.externalTrafficPolicy: Local` if you want the cleaner topology on a single-node cluster.
 
 ### 8.2 Port allocation
 
@@ -731,7 +731,7 @@ curseforgeBaseURL: ""                  # "" = real CurseForge; tests override
 
 ### 15.3 CRD upgrade policy
 
-CRDs live in chart's `crds/` dir — install only, not upgrade. Upgrades require explicit `kubectl apply -f crds/` or chart hook. Documented in `docs/installation.md`.
+The chart includes a `pre-install,pre-upgrade` Helm hook (a one-shot Job using a stock `bitnami/kubectl` image with cluster-scoped CRD permissions) that applies the chart-bundled CRD via `kubectl apply --server-side --force-conflicts`. The CRD file is loaded by the chart via `.Files.Get` from `deploy/helm/ark-asa-operator/files/` (note: deliberately not in `crds/`, which Helm treats as install-only). With this, `helm upgrade` keeps the CRD in sync with the operator version automatically — no manual `kubectl apply` step required.
 
 ### 15.4 Multi-arch images
 
