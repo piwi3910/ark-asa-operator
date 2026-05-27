@@ -182,7 +182,10 @@ func main() {
 	if err := (&controller.ArkClusterReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("arkcluster-controller"),
+		// GetEventRecorder in controller-runtime v0.23 returns the new
+		// events.EventRecorder with an incompatible Eventf signature; stick
+		// with the legacy record.EventRecorder for now.
+		Recorder: mgr.GetEventRecorderFor("arkcluster-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "arkcluster")
 		os.Exit(1)

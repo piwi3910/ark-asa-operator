@@ -32,13 +32,18 @@ func TestCollectModIDsDedupesAndSorts(t *testing.T) {
 
 func TestMergeModStatusDetectsChange(t *testing.T) {
 	now := metav1.Now()
-	existing := &arkv1.ModStatus{Tracked: []arkv1.TrackedMod{
-		{ID: 1, InstalledFileID: 100, LatestFileID: 100},
-	}}
+	cluster := &arkv1.ArkCluster{
+		Spec: arkv1.ArkClusterSpec{},
+		Status: arkv1.ArkClusterStatus{
+			Mods: &arkv1.ModStatus{Tracked: []arkv1.TrackedMod{
+				{ID: 1, InstalledFileID: 100, LatestFileID: 100},
+			}},
+		},
+	}
 	info := map[int64]curseforge.ModInfo{
 		1: {ID: 1, Slug: "x", LatestFileID: 200, LatestVersion: "v2"},
 	}
-	got, changed := mergeModStatus(existing, info, now)
+	got, changed := mergeModStatus(cluster, info, now)
 	if !changed {
 		t.Error("expected changed=true when latestFileID differs")
 	}
@@ -62,6 +67,45 @@ func TestMergeModStatusFirstSeenSetsInstalled(t *testing.T) {
 	if got[0].InstalledFileID != 999 || got[0].LatestFileID != 999 {
 		t.Errorf("first-sight should pin Installed=Latest, got %+v", got[0])
 	}
+}
+
+func TestMergeModStatusComputesAffectedMaps(t *testing.T) {
+	cluster := &arkv1.ArkCluster{
+		Spec: arkv1.ArkClusterSpec{
+			GlobalSettings: arkv1.GlobalSettings{Mods: []int64{927090}},
+			Maps: []arkv1.MapSpec{
+				{ID: "TheIsland_WP"},
+				{ID: "ScorchedEarth_WP", Mods: []int64{1056780}},
+			},
+		},
+	}
+	info := map[int64]curseforge.ModInfo{
+		927090:  {ID: 927090, LatestFileID: 100},
+		1056780: {ID: 1056780, LatestFileID: 200},
+	}
+	got, _ := mergeModStatus(cluster, info, metav1.Now())
+	byID := map[int64]arkv1.TrackedMod{}
+	for _, tm := range got {
+		byID[tm.ID] = tm
+	}
+	if want := []string{"TheIsland_WP"}; !equalStrings(byID[927090].AffectedMaps, want) {
+		t.Errorf("927090 AffectedMaps = %+v, want %+v", byID[927090].AffectedMaps, want)
+	}
+	if want := []string{"ScorchedEarth_WP"}; !equalStrings(byID[1056780].AffectedMaps, want) {
+		t.Errorf("1056780 AffectedMaps = %+v, want %+v", byID[1056780].AffectedMaps, want)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestHashTrackedStable(t *testing.T) {

@@ -92,7 +92,7 @@ func (r *ModUpdateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		_ = r.Status().Update(ctx, cluster)
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
-	tracked, changed := mergeModStatus(cluster.Status.Mods, info, now)
+	tracked, changed := mergeModStatus(cluster, info, now)
 	if cluster.Status.Mods == nil {
 		cluster.Status.Mods = &arkv1.ModStatus{}
 	}
@@ -149,10 +149,10 @@ func collectModIDs(cluster *arkv1.ArkCluster) []int64 {
 	return out
 }
 
-func mergeModStatus(existing *arkv1.ModStatus, info map[int64]curseforge.ModInfo, now metav1.Time) ([]arkv1.TrackedMod, bool) {
+func mergeModStatus(cluster *arkv1.ArkCluster, info map[int64]curseforge.ModInfo, now metav1.Time) ([]arkv1.TrackedMod, bool) {
 	prev := map[int64]arkv1.TrackedMod{}
-	if existing != nil {
-		for _, t := range existing.Tracked {
+	if cluster != nil && cluster.Status.Mods != nil {
+		for _, t := range cluster.Status.Mods.Tracked {
 			prev[t.ID] = t
 		}
 	}
@@ -167,6 +167,7 @@ func mergeModStatus(existing *arkv1.ModStatus, info map[int64]curseforge.ModInfo
 			LatestFileID:     mi.LatestFileID,
 			InstalledVersion: p.InstalledVersion,
 			InstalledFileID:  p.InstalledFileID,
+			AffectedMaps:     affectedMaps(cluster, id),
 		}
 		if !seen || t.InstalledFileID == 0 {
 			// First time seeing this mod — treat installed = current latest.
@@ -184,6 +185,41 @@ func mergeModStatus(existing *arkv1.ModStatus, info map[int64]curseforge.ModInfo
 	}
 	sort.Slice(tracked, func(i, j int) bool { return tracked[i].ID < tracked[j].ID })
 	return tracked, changed
+}
+
+// affectedMaps computes which map IDs reference a given mod ID.
+// Per-map mods replace globals — if a map has any entries in spec.maps[i].Mods,
+// the global mod list does not apply to that map.
+func affectedMaps(cluster *arkv1.ArkCluster, modID int64) []string {
+	if cluster == nil {
+		return nil
+	}
+	// Is this mod in the global list?
+	inGlobal := false
+	for _, m := range cluster.Spec.GlobalSettings.Mods {
+		if m == modID {
+			inGlobal = true
+			break
+		}
+	}
+	out := []string{}
+	for _, ms := range cluster.Spec.Maps {
+		if len(ms.Mods) > 0 {
+			for _, m := range ms.Mods {
+				if m == modID {
+					out = append(out, ms.ID)
+					break
+				}
+			}
+		} else if inGlobal {
+			out = append(out, ms.ID)
+		}
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func hashTracked(t []arkv1.TrackedMod) string {

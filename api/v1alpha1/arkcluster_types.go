@@ -255,6 +255,11 @@ type MapStatus struct {
 	SessionName    string       `json:"sessionName,omitempty"`
 	LastSaveTime   *metav1.Time `json:"lastSaveTime,omitempty"`
 	Pod            string       `json:"pod,omitempty"`
+	// LastGoodVolume records the previous ActiveVolume that was known-good.
+	// Used to symmetric-rollback regardless of whether ActiveVolume is server-a
+	// or server-b. Set on successful pod-ready transition in steady state, before
+	// the next blue/green swap.
+	LastGoodVolume string `json:"lastGoodVolume,omitempty"`
 	// DrainDeadline is the source of truth for an in-flight RCON drain.
 	// Persisted in status so operator restart never loses progress.
 	DrainDeadline *metav1.Time       `json:"drainDeadline,omitempty"`

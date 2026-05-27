@@ -791,6 +791,13 @@ spec:
                       type: string
                     id:
                       type: string
+                    lastGoodVolume:
+                      description: |-
+                        LastGoodVolume records the previous ActiveVolume that was known-good.
+                        Used to symmetric-rollback regardless of whether ActiveVolume is server-a
+                        or server-b. Set on successful pod-ready transition in steady state, before
+                        the next blue/green swap.
+                      type: string
                     lastSaveTime:
                       format: date-time
                       type: string

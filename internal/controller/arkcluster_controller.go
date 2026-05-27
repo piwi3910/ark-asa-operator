@@ -199,7 +199,7 @@ func (r *ArkClusterReconciler) reconcileMap(ctx context.Context, cluster *arkv1.
 		return nil
 	}
 	// Blue/green rollUpdate.
-	return r.rollUpdate(ctx, cluster, mapSpec, i, mapStatus, desiredHash, busy, activePod)
+	return r.rollUpdate(ctx, cluster, mapSpec, i, mapStatus, busy, activePod)
 }
 
 // gcOrphanedMaps deletes per-map Pods, Services, and (if not PersistOnDelete)
@@ -303,10 +303,11 @@ func (r *ArkClusterReconciler) steady(ctx context.Context, cluster *arkv1.ArkClu
 		cluster.Name, mapSpec.ID, friendlyName(mapSpec.ID))
 
 	// Auto-rollback (Amendment F bug 2): if pod is CrashLooping with R >= 3
-	// within ~5 min, swap back. Only auto-rolls back when we previously did a
-	// blue/green swap (active=server-b); when active=server-a it's a first-deploy
-	// failure with no prior good install to revert to.
-	if r.shouldRollback(pod) && mapStatus.ActiveVolume == "server-b" {
+	// within ~5 min, swap back to LastGoodVolume. Symmetric — works regardless
+	// of whether the current ActiveVolume is server-a or server-b. When no
+	// LastGoodVolume is recorded (first deploy never reached Ready), we have
+	// nothing to revert to and just surface a condition.
+	if r.shouldRollback(pod) && mapStatus.LastGoodVolume != "" && mapStatus.LastGoodVolume != mapStatus.ActiveVolume {
 		return r.rollback(ctx, cluster, mapSpec, mapStatus, busy, pod)
 	}
 	if r.shouldRollback(pod) {
@@ -324,6 +325,9 @@ func (r *ArkClusterReconciler) steady(ctx context.Context, cluster *arkv1.ArkClu
 
 	if podReady(pod) {
 		mapStatus.Phase = arkv1.MapPhaseRunning
+		// Record the currently-active volume as known-good so a future
+		// auto-rollback knows where to revert to.
+		mapStatus.LastGoodVolume = mapStatus.ActiveVolume
 		reconcile.SetMapCondition(cluster, mapSpec.ID, metav1.Condition{
 			Type: "PodReady", Status: metav1.ConditionTrue, Reason: "RCONReachable", Message: "pod ready",
 		})
@@ -337,8 +341,7 @@ func (r *ArkClusterReconciler) steady(ctx context.Context, cluster *arkv1.ArkClu
 }
 
 // rollUpdate: blue/green flow with Amendment F's persist-before-act ordering.
-func (r *ArkClusterReconciler) rollUpdate(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, i int, mapStatus *arkv1.MapStatus, desiredHash string, busy *bool, currentPod *corev1.Pod) error {
-	_ = desiredHash // desiredHash is recomputed after swap; current value not needed here
+func (r *ArkClusterReconciler) rollUpdate(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, i int, mapStatus *arkv1.MapStatus, busy *bool, currentPod *corev1.Pod) error {
 	*busy = true
 	inactive := otherSide(mapStatus.ActiveVolume)
 	inactiveSide := volumeSide(inactive)
@@ -427,7 +430,7 @@ func (r *ArkClusterReconciler) rollUpdate(ctx context.Context, cluster *arkv1.Ar
 // rollback: auto-rollback flow (Amendment F bug 2 — persist before delete).
 func (r *ArkClusterReconciler) rollback(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, mapStatus *arkv1.MapStatus, busy *bool, badPod *corev1.Pod) error {
 	*busy = true
-	previous := otherSide(mapStatus.ActiveVolume)
+	previous := mapStatus.LastGoodVolume
 	mapStatus.ActiveVolume = previous
 	reconcile.SetMapCondition(cluster, mapSpec.ID, metav1.Condition{
 		Type: "RollbackOccurred", Status: metav1.ConditionTrue, Reason: "PodCrashLooping",
