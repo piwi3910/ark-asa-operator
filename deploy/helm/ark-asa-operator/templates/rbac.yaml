@@ -1,0 +1,37 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [ark.watteel.com]
+    resources: [arkclusters, arkclusters/status, arkclusters/finalizers]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: [pods, services, persistentvolumeclaims, configmaps, secrets, events]
+    verbs: ["*"]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: ["*"]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: [services/status]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "ark-asa-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ark-asa-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

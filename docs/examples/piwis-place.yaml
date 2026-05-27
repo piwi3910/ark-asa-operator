@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: piwis-place-secrets
+  namespace: ark-operator
+stringData:
+  serverPassword: "62156215"
+---
+apiVersion: ark.watteel.com/v1alpha1
+kind: ArkCluster
+metadata:
+  name: piwis-place
+  namespace: ark-operator
+spec:
+  clusterID: piwis-place
+  maps:
+    - id: TheIsland_WP
+  globalSettings:
+    sessionNameFormat: "piwi's place"
+    serverPassword: { name: piwis-place-secrets, key: serverPassword }
+    maxPlayers: 70
+    battleye: false
+  storage:
+    storageClass: openebs-zfspv
+    clusterStorageClass: nfs-csi
+    serverPVCSize: 50Gi
+    savesPVCSize: 20Gi
+    clusterPVCSize: 5Gi
+  service:
+    type: LoadBalancer
+    gamePortStart: 7777
+    rconPortStart: 27020
+    loadBalancerIPs: ["192.168.10.210"]
+  resources:
+    requests: { cpu: 2, memory: 12Gi }
+    limits:   { cpu: 6, memory: 28Gi }

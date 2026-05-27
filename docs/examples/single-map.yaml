@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: example-secrets
+  namespace: ark-operator
+stringData:
+  serverPassword: "changeMe"
+---
+apiVersion: ark.watteel.com/v1alpha1
+kind: ArkCluster
+metadata:
+  name: example
+  namespace: ark-operator
+spec:
+  clusterID: example
+  maps:
+    - id: TheIsland_WP
+  globalSettings:
+    sessionNameFormat: "Example - {map}"
+    serverPassword: { name: example-secrets, key: serverPassword }
+    maxPlayers: 70
+  storage:
+    serverPVCSize: 50Gi
+    savesPVCSize: 20Gi
+    clusterPVCSize: 5Gi
+  service:
+    type: LoadBalancer
+    gamePortStart: 7777
+    rconPortStart: 27020
+  resources:
+    requests: { cpu: 2, memory: 12Gi }
+    limits:   { cpu: 6, memory: 28Gi }

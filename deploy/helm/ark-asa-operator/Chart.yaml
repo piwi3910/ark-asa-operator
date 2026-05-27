@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ark-asa-operator
+description: Kubernetes operator for ARK Survival Ascended dedicated servers.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [ark, ark-sa, dedicated-server, kubernetes-operator]
+maintainers:
+  - name: Pascal Watteel
+    email: pascal@watteel.com
+sources:
+  - https://github.com/piwi3910/ark-asa-operator

@@ -1,0 +1,82 @@
+{{- if .Values.installCRDs }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+data:
+  arkcluster.yaml: |-
+{{ .Files.Get "files/arkcluster-crd.yaml" | indent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-crd-apply
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "ark-asa-operator.fullname" . }}-crd-upgrader
+      containers:
+        - name: kubectl
+          image: bitnami/kubectl:1.31
+          command: ["/bin/sh", "-c"]
+          args:
+            - kubectl apply --server-side --force-conflicts -f /crd/arkcluster.yaml
+          volumeMounts:
+            - name: crd
+              mountPath: /crd
+      volumes:
+        - name: crd
+          configMap:
+            name: {{ include "ark-asa-operator.fullname" . }}-crd
+{{- end }}

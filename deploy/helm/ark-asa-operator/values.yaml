@@ -1,0 +1,35 @@
+image:
+  repository: ghcr.io/piwi3910/ark-asa-operator
+  tag: ""                       # defaults to chart appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+installCRDs: true               # whether to install/upgrade CRDs via pre-install/pre-upgrade hook
+namespace: ark-operator
+serviceAccount:
+  create: true
+  name: ""
+rbac:
+  create: true
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits:   { cpu: 500m, memory: 512Mi }
+nodeSelector: {}
+tolerations: []
+affinity: {}
+metrics:
+  enabled: true
+  port: 8080
+  serviceMonitor:
+    enabled: false
+    labels: {}
+webhook:
+  enabled: false                # opt-in: requires cert-manager or manual TLS provisioning
+leaderElection:
+  enabled: true
+logLevel: info
+podSecurityContext:
+  runAsNonRoot: true
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: { drop: [ALL] }
+  readOnlyRootFilesystem: true

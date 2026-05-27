@@ -1,0 +1,15 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ark-asa-operator.fullname" . }}-metrics
+  labels: {{- include "ark-asa-operator.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+  selector:
+    app.kubernetes.io/name: {{ include "ark-asa-operator.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
