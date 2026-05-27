@@ -413,6 +413,14 @@ func (r *ArkClusterReconciler) rollUpdate(ctx context.Context, cluster *arkv1.Ar
 	// Create new pod with the (newly-active) inactive volume.
 	newHash := r.computePodHash(ctx, cluster, mapSpec, i, mapStatus.ActiveVolume)
 	_, err := r.ensurePodForMap(ctx, cluster, mapSpec, i, mapStatus.ActiveVolume, newHash)
+	// Phase 4: after a successful pod recreate, mark all tracked mods as installed
+	// at their latest file ID — the new pod runs with the new mod set.
+	if err == nil && cluster.Status.Mods != nil {
+		for j := range cluster.Status.Mods.Tracked {
+			cluster.Status.Mods.Tracked[j].InstalledFileID = cluster.Status.Mods.Tracked[j].LatestFileID
+			cluster.Status.Mods.Tracked[j].InstalledVersion = cluster.Status.Mods.Tracked[j].LatestVersion
+		}
+	}
 	return err
 }
 
@@ -567,6 +575,11 @@ func (r *ArkClusterReconciler) computePodHash(ctx context.Context, cluster *arkv
 	}
 	iniRev := r.readResourceVersion(ctx, cluster.Namespace, "ConfigMap", reconcile.GUSConfigMapName(cluster.Name, mapSpec.ID)) +
 		"|" + r.readResourceVersion(ctx, cluster.Namespace, "ConfigMap", reconcile.GameConfigMapName(cluster.Name, mapSpec.ID))
+	// Amendment B + Phase 4: include the mods-changed annotation so a CurseForge
+	// version bump triggers a roll. Reuse IniRev field as the carrier.
+	if cluster.Annotations[AnnotationModsChanged] != "" {
+		iniRev += "|mods=" + cluster.Annotations[AnnotationModsChanged]
+	}
 	secretsRev := r.readResourceVersion(ctx, cluster.Namespace, "Secret", reconcile.SecretsName(cluster.Name))
 	if cluster.Spec.GlobalSettings.ServerPassword != nil {
 		secretsRev += "|" + r.readResourceVersion(ctx, cluster.Namespace, "Secret", cluster.Spec.GlobalSettings.ServerPassword.Name)
