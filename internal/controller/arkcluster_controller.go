@@ -10,6 +10,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	arkv1 "github.com/piwi3910/ark-asa-operator/api/v1alpha1"
@@ -88,14 +89,47 @@ func (r *ArkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// 2. Per-map fan-out (Phase 1: validated to exactly 1 by webhook)
+	// 2. Per-map fan-out.
+	// Phase 3: respect OneAtATime rollout — only one map allowed to be mid-update at a time.
+	midFlightMap := ""
+	rolloutPolicy := cluster.Spec.UpdateStrategy.Rollout
+	if rolloutPolicy == "" {
+		rolloutPolicy = arkv1.RolloutOneAtATime
+	}
+	if rolloutPolicy != arkv1.RolloutParallel {
+		for _, m := range cluster.Status.Maps {
+			if m.Phase == arkv1.MapPhaseDrainingActive || m.Phase == arkv1.MapPhaseSwapping || m.Phase == arkv1.MapPhaseInstallingInactive {
+				midFlightMap = m.ID
+				break
+			}
+		}
+	}
+
 	busy := false
 	for i, mapSpec := range cluster.Spec.Maps {
-		if err := r.reconcileMap(ctx, cluster, mapSpec, i, &busy); err != nil {
+		if err := r.reconcileMap(ctx, cluster, mapSpec, i, &busy, midFlightMap); err != nil {
 			logger.Error(err, "reconcileMap failed", "map", mapSpec.ID)
 			return ctrl.Result{}, err
 		}
 	}
+
+	// Phase 3: GC orphaned per-map resources.
+	keep := map[string]bool{}
+	for _, m := range cluster.Spec.Maps {
+		keep[ark.MapSlug(m.ID)] = true
+	}
+	if err := r.gcOrphanedMaps(ctx, cluster, keep); err != nil {
+		logger.Error(err, "gc orphaned maps")
+		return ctrl.Result{}, err
+	}
+	// Prune status.Maps to match.
+	filtered := cluster.Status.Maps[:0]
+	for _, m := range cluster.Status.Maps {
+		if keep[ark.MapSlug(m.ID)] {
+			filtered = append(filtered, m)
+		}
+	}
+	cluster.Status.Maps = filtered
 
 	// 3. Aggregate + persist status
 	cluster.Status.TotalMaps = int32(len(cluster.Spec.Maps))
@@ -115,7 +149,7 @@ func (r *ArkClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 // reconcileMap dispatches into firstStart / steady / rollUpdate based on whether
 // a pod exists and whether its hash matches the desired hash.
-func (r *ArkClusterReconciler) reconcileMap(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, i int, busy *bool) error {
+func (r *ArkClusterReconciler) reconcileMap(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, i int, busy *bool, midFlightMap string) error {
 	if err := reconcile.EnsureSavesPVC(ctx, r.Client, cluster, mapSpec.ID); err != nil {
 		return err
 	}
@@ -158,8 +192,80 @@ func (r *ArkClusterReconciler) reconcileMap(ctx context.Context, cluster *arkv1.
 		return r.steady(ctx, cluster, mapSpec, mapStatus, activePod, busy)
 	}
 
-	// Case C — drift. Blue/green rollUpdate.
+	// Case C — drift. OneAtATime hold-back: if another map is mid-update and
+	// we're not it, leave current pod alone and let the next reconcile retry.
+	if midFlightMap != "" && midFlightMap != mapSpec.ID {
+		*busy = true
+		return nil
+	}
+	// Blue/green rollUpdate.
 	return r.rollUpdate(ctx, cluster, mapSpec, i, mapStatus, desiredHash, busy, activePod)
+}
+
+// gcOrphanedMaps deletes per-map Pods, Services, and (if not PersistOnDelete)
+// PVCs whose map is no longer in spec. The shared cluster-transfer PVC is preserved.
+func (r *ArkClusterReconciler) gcOrphanedMaps(ctx context.Context, cluster *arkv1.ArkCluster, keep map[string]bool) error {
+	sel := client.MatchingLabels{"ark.watteel.com/cluster": cluster.Name}
+
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), sel); err == nil {
+		for i := range pods.Items {
+			slug := pods.Items[i].Labels["ark.watteel.com/map"]
+			if slug != "" && !keep[slug] {
+				_ = r.Delete(ctx, &pods.Items[i])
+			}
+		}
+	}
+	var svcs corev1.ServiceList
+	if err := r.List(ctx, &svcs, client.InNamespace(cluster.Namespace), sel); err == nil {
+		for i := range svcs.Items {
+			slug := svcs.Items[i].Labels["ark.watteel.com/map"]
+			if slug != "" && !keep[slug] {
+				_ = r.Delete(ctx, &svcs.Items[i])
+			}
+		}
+	}
+	if !cluster.Spec.Storage.PersistOnDelete {
+		var pvcs corev1.PersistentVolumeClaimList
+		if err := r.List(ctx, &pvcs, client.InNamespace(cluster.Namespace), sel); err == nil {
+			for i := range pvcs.Items {
+				name := pvcs.Items[i].Name
+				// Cluster-shared PVC stays regardless of which maps are present.
+				if name == reconcile.PVCNameCluster(cluster.Name) {
+					continue
+				}
+				// Per-map PVCs follow naming <cluster>-<slug>-...
+				belongs := false
+				for slug := range keep {
+					if strings.HasPrefix(name, cluster.Name+"-"+slug+"-") {
+						belongs = true
+						break
+					}
+				}
+				if !belongs {
+					_ = r.Delete(ctx, &pvcs.Items[i])
+				}
+			}
+		}
+	}
+	// Same treatment for orphaned ConfigMaps.
+	var cms corev1.ConfigMapList
+	if err := r.List(ctx, &cms, client.InNamespace(cluster.Namespace), sel); err == nil {
+		for i := range cms.Items {
+			name := cms.Items[i].Name
+			belongs := false
+			for slug := range keep {
+				if strings.HasPrefix(name, cluster.Name+"-"+slug+"-") {
+					belongs = true
+					break
+				}
+			}
+			if !belongs && (strings.HasSuffix(name, "-gus") || strings.HasSuffix(name, "-game")) {
+				_ = r.Delete(ctx, &cms.Items[i])
+			}
+		}
+	}
+	return nil
 }
 
 // firstStart: ensure init Job on active volume, then create initial pod.

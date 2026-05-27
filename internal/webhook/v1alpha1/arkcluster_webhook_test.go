@@ -28,7 +28,7 @@ import (
 	arkv1alpha1 "github.com/piwi3910/ark-asa-operator/api/v1alpha1"
 )
 
-func TestValidateRejectsMultiMapInPhase1(t *testing.T) {
+func TestValidateAcceptsMultiMap(t *testing.T) {
 	c := &arkv1alpha1.ArkCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "n"},
 		Spec: arkv1alpha1.ArkClusterSpec{
@@ -38,8 +38,8 @@ func TestValidateRejectsMultiMapInPhase1(t *testing.T) {
 		},
 	}
 	v := &ArkClusterCustomValidator{}
-	if _, err := v.ValidateCreate(context.Background(), c); err == nil {
-		t.Error("expected multi-map to be rejected in phase 1")
+	if _, err := v.ValidateCreate(context.Background(), c); err != nil {
+		t.Errorf("multi-map should now be allowed in phase 3; got: %v", err)
 	}
 }
 

@@ -34,7 +34,7 @@ var arkclusterlog = logf.Log.WithName("arkcluster-resource")
 
 // phase1SingleMapEnforced gates the temporary "exactly one map" restriction.
 // Flip to false in Phase 3 to allow multi-map clusters.
-const phase1SingleMapEnforced = true
+const phase1SingleMapEnforced = false // Phase 3: multi-map allowed
 
 // SetupArkClusterWebhookWithManager registers the webhook for ArkCluster in the manager.
 func SetupArkClusterWebhookWithManager(mgr ctrl.Manager) error {

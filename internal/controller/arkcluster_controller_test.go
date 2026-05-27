@@ -57,4 +57,26 @@ var _ = Describe("ArkClusterReconciler", func() {
 			return k8sClient.Get(ctx, types.NamespacedName{Name: "test-1-island-saves", Namespace: ns}, pvc)
 		}, 30*time.Second, 200*time.Millisecond).Should(Succeed())
 	})
+
+	It("creates resources for two maps simultaneously", func() {
+		ac := &arkv1alpha1.ArkCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "twomap", Namespace: ns},
+			Spec: arkv1alpha1.ArkClusterSpec{
+				ClusterID: "twomap",
+				Image:     "img:dev",
+				Maps:      []arkv1alpha1.MapSpec{{ID: "TheIsland_WP"}, {ID: "ScorchedEarth_WP"}},
+				Service:   arkv1alpha1.ServiceSpec{Type: corev1.ServiceTypeClusterIP, GamePortStart: 7777, RconPortStart: 27020, ExternalTrafficPolicy: corev1.ServiceExternalTrafficPolicyCluster},
+				Storage:   arkv1alpha1.StorageSpec{ServerPVCSize: "1Gi", SavesPVCSize: "1Gi", ClusterPVCSize: "1Gi", ClusterStorageClass: "standard"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ac)).To(Succeed())
+		Eventually(func() error {
+			s := &corev1.Service{}
+			return k8sClient.Get(ctx, types.NamespacedName{Name: "twomap-scorched-earth", Namespace: ns}, s)
+		}, 30*time.Second, 200*time.Millisecond).Should(Succeed())
+		Eventually(func() error {
+			p := &corev1.PersistentVolumeClaim{}
+			return k8sClient.Get(ctx, types.NamespacedName{Name: "twomap-scorched-earth-saves", Namespace: ns}, p)
+		}, 30*time.Second, 200*time.Millisecond).Should(Succeed())
+	})
 })
