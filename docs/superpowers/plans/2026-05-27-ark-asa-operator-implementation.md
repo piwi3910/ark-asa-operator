@@ -6748,3 +6748,219 @@ After applying A–E, the affected commit count grows by ~5 (one per amendment).
 - E goes in inside Task 1.16
 
 No phase exit criteria change.
+
+### Amendment F — Persist-before-act for irreversible world transitions
+
+**Problem:** in three places, the reconciler mutates `mapStatus` in memory, then performs k8s API actions on the world, then lets the outer `Status().Update` persist the changes. If the operator dies between the world-action and the persist, the next reconcile reads stale status and "fixes" the world — but the fix is wrong because the world already moved forward.
+
+Affected sites: blue/green swap, auto-rollback, RCON drain announce.
+
+**Fix:** add an explicit `r.Status().Update(ctx, cluster)` *between* the in-memory status mutation and any irreversible world-side action. Any failed Status().Update bails out before acting on the world.
+
+**Helper to add** in `internal/controller/arkcluster_controller.go`:
+
+```go
+// persistStatus writes status with a retry on conflict. Called explicitly at
+// transition boundaries to guarantee "intent persists before action".
+func (r *ArkClusterReconciler) persistStatus(ctx context.Context, cluster *arkv1.ArkCluster) error {
+	if err := r.Status().Update(ctx, cluster); err != nil && !apierrors.IsConflict(err) {
+		return fmt.Errorf("persist status: %w", err)
+	}
+	return nil
+}
+```
+
+**Apply to rollUpdate — drain start (Bug 3):**
+
+Original (in Task 2.3):
+```go
+// Step B: drain active pod
+if mapStatus.DrainDeadline == nil {
+	grace := cluster.Spec.UpdateStrategy.GracefulShutdown
+	deadline := metav1.NewTime(time.Now().Add(grace.Duration))
+	mapStatus.DrainDeadline = &deadline
+	mapStatus.Phase = arkv1.MapPhaseDrainingActive
+
+	if grace.Duration > 0 && mapStatus.RconAddress != "" {
+		pw, _ := r.readAdminPassword(ctx, cluster)
+		_ = rcon.AnnounceShutdown(ctx, mapStatus.RconAddress, pw, grace.Duration, "cluster update")
+	}
+	return nil
+}
+```
+
+Replace with:
+```go
+if mapStatus.DrainDeadline == nil {
+	grace := cluster.Spec.UpdateStrategy.GracefulShutdown
+	deadline := metav1.NewTime(time.Now().Add(grace.Duration))
+	mapStatus.DrainDeadline = &deadline
+	mapStatus.Phase = arkv1.MapPhaseDrainingActive
+
+	// Persist intent BEFORE issuing the announce. If we die after the persist
+	// but before the announce, restart sees deadline != nil and skips the
+	// re-announce path (relying on player UI showing the deadline approach via
+	// the in-game timer rather than another chat message).
+	if err := r.persistStatus(ctx, cluster); err != nil {
+		return err
+	}
+	if grace.Duration > 0 && mapStatus.RconAddress != "" {
+		pw, _ := r.readAdminPassword(ctx, cluster)
+		_ = rcon.AnnounceShutdown(ctx, mapStatus.RconAddress, pw, grace.Duration, "cluster update")
+	}
+	return nil
+}
+```
+
+**Apply to rollUpdate — swap (Bug 1):**
+
+Original swap sequence:
+```go
+// Deadline reached — SaveAndExit + delete pod + swap
+if mapStatus.RconAddress != "" {
+	pw, _ := r.readAdminPassword(ctx, cluster)
+	_ = rcon.SaveAndExit(ctx, mapStatus.RconAddress, pw)
+}
+pods, _ := listMapPods(ctx, r.Client, cluster, mapSpec.ID)
+for j := range pods {
+	if pods[j].DeletionTimestamp == nil {
+		grace := int64(60)
+		_ = r.Delete(ctx, &pods[j], &client.DeleteOptions{GracePeriodSeconds: &grace})
+	}
+}
+
+// Step C: swap active volume (in-memory only)
+mapStatus.ActiveVolume = inactive
+mapStatus.PendingBuildID = ""
+mapStatus.DrainDeadline = nil
+mapStatus.Phase = arkv1.MapPhaseSwapping
+
+// Step D: create new pod
+newHash := computePodHash(cluster, mapSpec, i, mapStatus.ActiveVolume)
+_, err := reconcile.EnsurePod(ctx, r.Client, reconcile.PodInput{ ... ActiveVolume: mapStatus.ActiveVolume ... })
+return err
+```
+
+Replace with:
+```go
+// Step B-tail: best-effort SaveAndExit before we change the active-volume pointer.
+// This is idempotent at the world level (re-issuing SaveWorld on a dead server is harmless).
+if mapStatus.RconAddress != "" {
+	pw, _ := r.readAdminPassword(ctx, cluster)
+	_ = rcon.SaveAndExit(ctx, mapStatus.RconAddress, pw)
+}
+
+// Step C: COMMIT THE SWAP IN STATUS FIRST.
+// After this Status().Update returns, server-b is the active volume from the
+// operator's perspective. Any subsequent reconcile (including after a crash here)
+// will see the new active volume and converge by deleting stale pods and creating
+// the new pod on the new active volume.
+mapStatus.ActiveVolume = inactive
+mapStatus.PendingBuildID = ""
+mapStatus.DrainDeadline = nil
+mapStatus.Phase = arkv1.MapPhaseSwapping
+if err := r.persistStatus(ctx, cluster); err != nil {
+	return err
+}
+
+// Step D: now act on the world. EnsurePod is idempotent — it lists pods, deletes
+// those that don't match the desired (post-swap) hash, and creates the missing one.
+// If the operator dies between persist and EnsurePod, restart re-enters here,
+// sees ActiveVolume already = inactive (in status), and runs the same code path.
+newHash := r.computePodHash(ctx, cluster, mapSpec, i, mapStatus.ActiveVolume)
+_, err := reconcile.EnsurePod(ctx, r.Client, reconcile.PodInput{
+	Cluster: cluster, MapID: mapSpec.ID, MapIndex: i,
+	FriendlyMap: friendlyName(mapSpec.ID), ActiveVolume: mapStatus.ActiveVolume, Hash: newHash,
+})
+return err
+```
+
+**Apply to rollback (Bug 2):**
+
+Original:
+```go
+func (r *ArkClusterReconciler) rollback(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, mapStatus *arkv1.MapStatus, busy *bool) error {
+	*busy = true
+	previous := otherSide(mapStatus.ActiveVolume)
+	mapStatus.ActiveVolume = previous
+	pods, _ := listMapPods(ctx, r.Client, cluster, mapSpec.ID)
+	for j := range pods {
+		if pods[j].DeletionTimestamp == nil {
+			grace := int64(0)
+			_ = r.Delete(ctx, &pods[j], &client.DeleteOptions{GracePeriodSeconds: &grace})
+		}
+	}
+	reconcile.SetMapCondition(cluster, mapSpec.ID, metav1.Condition{
+		Type: "RollbackOccurred", Status: metav1.ConditionTrue, Reason: "PodCrashLooping",
+		Message: fmt.Sprintf("auto-rolled back to %s after crash loop", previous),
+	})
+	r.Recorder.Eventf(cluster, corev1.EventTypeWarning, "AutoRollback",
+		"map %s rolled back to %s due to crash loop", mapSpec.ID, previous)
+	return nil
+}
+```
+
+Replace with:
+```go
+func (r *ArkClusterReconciler) rollback(ctx context.Context, cluster *arkv1.ArkCluster, mapSpec arkv1.MapSpec, mapStatus *arkv1.MapStatus, busy *bool) error {
+	*busy = true
+	previous := otherSide(mapStatus.ActiveVolume)
+
+	// Commit the rollback intent in status FIRST. If the operator dies after the
+	// status persist but before pod deletion, the next reconcile sees the
+	// rolled-back ActiveVolume and converges correctly.
+	mapStatus.ActiveVolume = previous
+	reconcile.SetMapCondition(cluster, mapSpec.ID, metav1.Condition{
+		Type: "RollbackOccurred", Status: metav1.ConditionTrue, Reason: "PodCrashLooping",
+		Message: fmt.Sprintf("auto-rolled back to %s after crash loop", previous),
+	})
+	if err := r.persistStatus(ctx, cluster); err != nil {
+		return err
+	}
+
+	// Now act on the world: delete the broken pod. The outer reconcile loop will
+	// create a fresh pod on the rolled-back volume on the next pass via EnsurePod.
+	pods, _ := listMapPods(ctx, r.Client, cluster, mapSpec.ID)
+	for j := range pods {
+		if pods[j].DeletionTimestamp == nil {
+			grace := int64(0)
+			_ = r.Delete(ctx, &pods[j], &client.DeleteOptions{GracePeriodSeconds: &grace})
+		}
+	}
+	r.Recorder.Eventf(cluster, corev1.EventTypeWarning, "AutoRollback",
+		"map %s rolled back to %s due to crash loop", mapSpec.ID, previous)
+	return nil
+}
+```
+
+**Add regression tests** (envtest, in `internal/controller/arkcluster_controller_test.go`):
+
+```go
+It("survives operator restart between drain announce and deadline persist", func() {
+	// Setup: ArkCluster running, then patch image to trigger update.
+	// Inject a controlled crash by overriding rcon.AnnounceShutdown to panic.
+	// On restart, verify: no second announce was issued (verify via the fake's
+	// per-call counter), and the deadline IS set.
+	// (Requires the operator binary or its rcon stub to be injectable in envtest.)
+})
+
+It("survives operator restart between swap status persist and pod creation", func() {
+	// Setup: ArkCluster running, trigger update, manually patch status so the swap
+	// has been persisted (ActiveVolume=inactive) but no pod exists.
+	// Run a single reconcile pass.
+	// Verify: a new pod is created on the new ActiveVolume; no pod is created on
+	// the old ActiveVolume.
+})
+
+It("survives operator restart mid-rollback (status persisted, pod not yet deleted)", func() {
+	// Setup: ArkCluster running, status.ActiveVolume=server-b, simulated
+	// rollback partial: status patched to ActiveVolume=server-a + RollbackOccurred
+	// condition, but the server-b pod still exists.
+	// Run a single reconcile pass.
+	// Verify: server-b pod is deleted; new pod created on server-a.
+})
+```
+
+**Apply at:** Task 2.3 (replaces the rollUpdate and rollback bodies); add tests as Task 2.5 (alongside the existing AngellusMortis regression test).
+
+**Impact:** one additional `persistStatus` call per drain start, per swap, per rollback. Adds at most ~50ms per transition (one API call). Cheap insurance against a class of subtle bugs.
