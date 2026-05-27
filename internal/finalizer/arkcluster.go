@@ -1,15 +1,18 @@
 // Package finalizer holds the ArkCluster graceful-shutdown finalizer.
 //
-// Phase 1: just adds/removes the finalizer string. The intent is that on
-// cluster delete the controller runs `RunFinalize` once, which removes the
-// finalizer so GC can cascade through owner refs. Phase 2 will add explicit
-// RCON SaveAndExit on every running pod before the finalizer is removed.
+// On cluster delete, the controller invokes RunFinalize which:
+//  1. Issues RCON SaveWorld + DoExit on every running pod (best-effort, bounded timeout).
+//  2. Removes the finalizer so GC can cascade through owner refs.
 package finalizer
 
 import (
 	"context"
+	"time"
 
 	arkv1 "github.com/piwi3910/ark-asa-operator/api/v1alpha1"
+	"github.com/piwi3910/ark-asa-operator/internal/rcon"
+	"github.com/piwi3910/ark-asa-operator/internal/reconcile"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
@@ -17,10 +20,11 @@ import (
 // Name is the finalizer string stamped on ArkCluster resources.
 const Name = "ark.watteel.com/graceful-shutdown"
 
+// drainTimeoutPerMap caps each per-map RCON drain call. The finalizer is
+// best-effort; we'd rather move on than stall deletion forever.
+const drainTimeoutPerMap = 30 * time.Second
+
 // Ensure adds the finalizer to the cluster if not already present.
-// Returns (added, error). When added=true, a Status().Update or Update on the
-// cluster has already happened; the controller should requeue to pick up the
-// new resourceVersion.
 func Ensure(ctx context.Context, c client.Client, cluster *arkv1.ArkCluster) (bool, error) {
 	if controllerutil.ContainsFinalizer(cluster, Name) {
 		return false, nil
@@ -29,18 +33,37 @@ func Ensure(ctx context.Context, c client.Client, cluster *arkv1.ArkCluster) (bo
 	return true, c.Update(ctx, cluster)
 }
 
-// RunFinalize performs final cleanup on cluster delete and removes the
-// finalizer. Returns (done, error). When done=true, the API server's garbage
-// collector cascades through owner refs and reclaims the cluster's resources
-// (modulo spec.storage.persistOnDelete, which Phase 1 doesn't implement yet).
-//
-// Phase 1: removal only. Container preStop hook + Pod restartPolicy give us
-// reasonable graceful shutdown per pod; Phase 2 will add explicit RCON
-// SaveAndExit on every running pod here before removal.
+// RunFinalize issues RCON SaveAndExit on each map's running pod, then removes
+// the finalizer so GC can cascade. Returns (done, error).
 func RunFinalize(ctx context.Context, c client.Client, cluster *arkv1.ArkCluster) (bool, error) {
 	if !controllerutil.ContainsFinalizer(cluster, Name) {
 		return true, nil
 	}
+	pw, err := readAdminPassword(ctx, c, cluster)
+	if err == nil {
+		for _, m := range cluster.Status.Maps {
+			if m.RconAddress == "" {
+				continue
+			}
+			drainCtx, cancel := context.WithTimeout(ctx, drainTimeoutPerMap)
+			_ = rcon.SaveAndExit(drainCtx, m.RconAddress, pw)
+			cancel()
+		}
+	}
 	controllerutil.RemoveFinalizer(cluster, Name)
 	return true, c.Update(ctx, cluster)
+}
+
+func readAdminPassword(ctx context.Context, c client.Client, cluster *arkv1.ArkCluster) (string, error) {
+	sel := cluster.Spec.GlobalSettings.AdminPassword
+	name := reconcile.SecretsName(cluster.Name)
+	key := "adminPassword"
+	if sel != nil {
+		name, key = sel.Name, sel.Key
+	}
+	sec := &corev1.Secret{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: name}, sec); err != nil {
+		return "", err
+	}
+	return string(sec.Data[key]), nil
 }
