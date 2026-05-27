@@ -9,7 +9,7 @@ import (
 func TestSessionName(t *testing.T) {
 	tests := []struct {
 		name, format, cluster, mapID, friendlyMap string
-		want                                       string
+		want                                      string
 	}{
 		{"plain", "piwi’s place", "piwis-place", "TheIsland_WP", "The Island", "piwi’s place"},
 		{"with cluster", "{cluster}", "piwis-place", "TheIsland_WP", "The Island", "piwis-place"},

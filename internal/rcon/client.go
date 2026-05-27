@@ -3,11 +3,12 @@
 // SaveWorld, DoExit, ServerChat, and ListPlayers against ARK server pods.
 //
 // Source RCON wire format:
-//   int32 length (little-endian, NOT including the length field itself)
-//   int32 requestID
-//   int32 packetType (3=Auth, 2=ExecCommand, 0=ResponseValue, 2=AuthResponse)
-//   string body (null-terminated)
-//   byte 0 (extra terminator)
+//
+//	int32 length (little-endian, NOT including the length field itself)
+//	int32 requestID
+//	int32 packetType (3=Auth, 2=ExecCommand, 0=ResponseValue, 2=AuthResponse)
+//	string body (null-terminated)
+//	byte 0 (extra terminator)
 package rcon
 
 import (
