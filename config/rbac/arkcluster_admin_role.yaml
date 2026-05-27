@@ -1,0 +1,27 @@
+# This rule is not used by the project ark-asa-operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants full permissions ('*') over ark.watteel.com.
+# This role is intended for users authorized to modify roles and bindings within the cluster,
+# enabling them to delegate specific permissions to other users or groups as needed.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: ark-asa-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: arkcluster-admin-role
+rules:
+- apiGroups:
+  - ark.watteel.com
+  resources:
+  - arkclusters
+  verbs:
+  - '*'
+- apiGroups:
+  - ark.watteel.com
+  resources:
+  - arkclusters/status
+  verbs:
+  - get

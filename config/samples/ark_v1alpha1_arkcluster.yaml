@@ -1,0 +1,9 @@
+apiVersion: ark.watteel.com/v1alpha1
+kind: ArkCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: ark-asa-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: arkcluster-sample
+spec:
+  # TODO(user): Add fields here

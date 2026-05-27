@@ -1,0 +1,29 @@
+# This rule is not used by the project ark-asa-operator itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to ark.watteel.com resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: ark-asa-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: arkcluster-viewer-role
+rules:
+- apiGroups:
+  - ark.watteel.com
+  resources:
+  - arkclusters
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ark.watteel.com
+  resources:
+  - arkclusters/status
+  verbs:
+  - get
