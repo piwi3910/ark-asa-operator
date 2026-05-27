@@ -446,9 +446,9 @@ spec:
         - { name: game, containerPort: 7777, protocol: UDP }
         - { name: rcon, containerPort: 27020, protocol: TCP }
       resources: <spec.resources>
-      startupProbe: { tcpSocket: rcon, initialDelaySeconds: 60, periodSeconds: 10, failureThreshold: 60 }   # 10-min budget
-      readinessProbe: { rcon ListPlayers via shell script, periodSeconds: 15, timeoutSeconds: 10, failureThreshold: 4 }
-      # NO liveness probe — operator handles liveness via reconcile loop
+      startupProbe: { tcpSocket: rcon, initialDelaySeconds: 60, periodSeconds: 10, failureThreshold: 60 }   # 10-min budget for cold start
+      readinessProbe: { tcpSocket: rcon, periodSeconds: 15, timeoutSeconds: 10, failureThreshold: 4 }
+      livenessProbe: { exec: rcon ListPlayers, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 10 }   # 5-min unresponsiveness budget
       lifecycle:
         preStop:
           exec: ["/bin/sh", "-c", "rcon SaveWorld; rcon DoExit"]   # bash /dev/tcp client
@@ -470,7 +470,7 @@ spec:
 
 ### 9.2 Key choices
 
-- **No livenessProbe.** ARK SA on Proton is too unpredictable; kubelet-driven restarts cause harm. Operator drives liveness via observed state + RCON health.
+- **Generous RCON-exec livenessProbe.** Calls `rcon -a 127.0.0.1:${RCON_PORT} -p "${SERVER_ADMIN_PASSWORD}" ListPlayers`. The `rcon` binary is already present in the `sknnr/ark-ascended-server` image (gorcon's `rcon-cli` at `/usr/local/bin/rcon`). 30-second period × 10 failure threshold = 5-minute budget before kubelet restarts the container, generous enough to absorb legitimate slow ticks (SaveWorld during heavy load, dense dino spawns). Gated by the startup probe, so a slow-loading server isn't killed while still booting. Liveness restart goes through the container's `preStop` (RCON SaveWorld + DoExit), so we get graceful behaviour for free. Auto-rollback on CrashLoop (R≥3 in 5 min) remains operator-driven and is layered on top.
 - **`preStop` runs RCON SaveWorld + DoExit.** Two-layer drain: operator pre-delete RCON announce + container-level preStop. `terminationGracePeriodSeconds: 1800` covers the longest sane window.
 - **RCON over plain TCP from a bash script in the image.** No external CLI dep; bash `/dev/tcp` writes the RCON protocol frames. Implementation under `internal/rcon` (see Section 13).
 - **Admin password in a Secret mounted at `/etc/rcon/config`** so probe + preStop don't expand env vars on the command line.

@@ -2135,6 +2135,7 @@ git commit -m "feat(reconcile): per-map GameUserSettings.ini + Game.ini ConfigMa
 package reconcile
 
 import (
+	"strings"
 	"testing"
 
 	arkv1 "github.com/piwi3910/ark-asa-operator/api/v1alpha1"
@@ -2191,11 +2192,24 @@ func TestBuildServerPodEnv(t *testing.T) {
 	}
 }
 
-func TestBuildServerPodHasNoLivenessProbe(t *testing.T) {
+func TestBuildServerPodHasGenerousLivenessProbe(t *testing.T) {
 	cluster := &arkv1.ArkCluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"}, Spec: arkv1.ArkClusterSpec{ClusterID: "c"}}
 	pod := BuildServerPod(PodInput{Cluster: cluster, MapID: "m", ActiveVolume: "server-a"})
-	if pod.Spec.Containers[0].LivenessProbe != nil {
-		t.Error("liveness probe must be nil — operator drives liveness")
+	lp := pod.Spec.Containers[0].LivenessProbe
+	if lp == nil {
+		t.Fatal("expected a livenessProbe (RCON ListPlayers, 5-min budget)")
+	}
+	if lp.Exec == nil || len(lp.Exec.Command) == 0 {
+		t.Fatal("livenessProbe must be exec-based")
+	}
+	// Verify it invokes the bundled rcon binary against the in-container loopback.
+	cmd := strings.Join(lp.Exec.Command, " ")
+	if !strings.Contains(cmd, "rcon") || !strings.Contains(cmd, "ListPlayers") {
+		t.Errorf("livenessProbe should call rcon ListPlayers; got %q", cmd)
+	}
+	if lp.PeriodSeconds != 30 || lp.TimeoutSeconds != 10 || lp.FailureThreshold != 10 {
+		t.Errorf("livenessProbe timing should be 30s × 10 = 5-min budget; got period=%d timeout=%d threshold=%d",
+			lp.PeriodSeconds, lp.TimeoutSeconds, lp.FailureThreshold)
 	}
 }
 ```
@@ -2326,12 +2340,27 @@ func BuildServerPod(in PodInput) *corev1.Pod {
 						TimeoutSeconds:   10,
 						FailureThreshold: 4,
 					},
-					// LivenessProbe deliberately nil — operator manages liveness via observed state + RCON checks.
+					// LivenessProbe: RCON ListPlayers via gorcon `rcon` already at /usr/local/bin/rcon in the sknnr image.
+					// Gated by startupProbe (kubelet doesn't run liveness until startup succeeds), so cold-start is safe.
+					// 30s × 10 failures = 5-min budget before kubelet restarts; absorbs SaveWorld pauses + dense-spawn ticks.
+					// Auto-rollback on CrashLoop (R≥3 in 5min) is layered on top in the controller.
+					LivenessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							Exec: &corev1.ExecAction{
+								Command: []string{"/bin/sh", "-c",
+									`rcon -a 127.0.0.1:${RCON_PORT} -p "${SERVER_ADMIN_PASSWORD}" ListPlayers`,
+								},
+							},
+						},
+						PeriodSeconds:    30,
+						TimeoutSeconds:   10,
+						FailureThreshold: 10,
+					},
 					Lifecycle: &corev1.Lifecycle{
 						PreStop: &corev1.LifecycleHandler{
 							Exec: &corev1.ExecAction{
 								Command: []string{"/bin/sh", "-c",
-									`exec 5<>/dev/tcp/127.0.0.1/${RCON_PORT}; sleep 1; exit 0`,
+									`rcon -a 127.0.0.1:${RCON_PORT} -p "${SERVER_ADMIN_PASSWORD}" SaveWorld; rcon -a 127.0.0.1:${RCON_PORT} -p "${SERVER_ADMIN_PASSWORD}" DoExit; sleep 1`,
 								},
 							},
 						},
