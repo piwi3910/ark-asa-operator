@@ -10,6 +10,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -587,6 +588,19 @@ func (r *ArkClusterReconciler) computePodHash(ctx context.Context, cluster *arkv
 	if cluster.Spec.GlobalSettings.ServerPassword != nil {
 		secretsRev += "|" + r.readResourceVersion(ctx, cluster.Namespace, "Secret", cluster.Spec.GlobalSettings.ServerPassword.Name)
 	}
+	// Launch-relevant spec fields that affect the pod's env vars but aren't
+	// captured by anything else. Without this, edits to sessionNameFormat,
+	// extraOptions, extraParams, maxPlayers, allowedPlatforms, battleye, or
+	// clusterID don't propagate to the pod (silent stale config).
+	launchRev := fmt.Sprintf("sn=%s|cid=%s|mp=%d|be=%v|ap=%s|eo=%s|ep=%s",
+		cluster.Spec.GlobalSettings.SessionNameFormat,
+		cluster.Spec.ClusterID,
+		cluster.Spec.GlobalSettings.MaxPlayers,
+		cluster.Spec.GlobalSettings.BattlEye,
+		joinSorted(cluster.Spec.GlobalSettings.AllowedPlatforms),
+		joinSorted(cluster.Spec.GlobalSettings.ExtraOptions),
+		joinSorted(cluster.Spec.GlobalSettings.ExtraParams),
+	)
 	return ark.PodTemplateHash(ark.PodTemplateHashInput{
 		Image:        cluster.Spec.Image,
 		Mods:         mods,
@@ -595,7 +609,21 @@ func (r *ArkClusterReconciler) computePodHash(ctx context.Context, cluster *arkv
 		ActiveVolume: activeVolume,
 		IniRev:       iniRev,
 		SecretsRev:   secretsRev,
+		LaunchRev:    launchRev,
 	})
+}
+
+// joinSorted returns the elements of s joined by "," after sorting in place.
+// Used in launchRev so that re-ordering a list (which doesn't change semantics)
+// doesn't unnecessarily trigger a roll.
+func joinSorted(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	cp := make([]string, len(s))
+	copy(cp, s)
+	sort.Strings(cp)
+	return strings.Join(cp, ",")
 }
 
 func (r *ArkClusterReconciler) readResourceVersion(ctx context.Context, ns, kind, name string) string {

@@ -9,7 +9,11 @@ import (
 // PodTemplateHashInput is the set of inputs that, when changed, must trigger
 // a pod recreate (blue/green roll in Phase 2+). SecretsRev and IniRev are the
 // resourceVersions of referenced Secrets and ConfigMaps so that edits to
-// those propagate via the hash (per Amendment B).
+// those propagate via the hash (per Amendment B). LaunchRev is a digest of
+// all spec fields that affect the launch command / env vars (session name
+// format, max players, extraOptions, extraParams, allowedPlatforms,
+// BattlEye, clusterID) — without it, edits to those fields are silently
+// ignored by the controller.
 type PodTemplateHashInput struct {
 	Image        string
 	Mods         []int64
@@ -17,6 +21,7 @@ type PodTemplateHashInput struct {
 	RconPort     int32
 	SecretsRev   string
 	IniRev       string
+	LaunchRev    string
 	ActiveVolume string
 }
 
@@ -25,9 +30,9 @@ type PodTemplateHashInput struct {
 // controller deletes pods whose label doesn't match the desired hash and
 // creates a fresh pod with the new hash.
 func PodTemplateHash(in PodTemplateHashInput) string {
-	s := fmt.Sprintf("%s|%s|%d|%d|%s|%s|%s",
+	s := fmt.Sprintf("%s|%s|%d|%d|%s|%s|%s|%s",
 		in.Image, ModSetHash(in.Mods), in.GamePort, in.RconPort,
-		in.SecretsRev, in.IniRev, in.ActiveVolume)
+		in.SecretsRev, in.IniRev, in.LaunchRev, in.ActiveVolume)
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:8])
 }
